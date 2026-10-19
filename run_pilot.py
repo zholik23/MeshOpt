@@ -18,12 +18,36 @@ Optional external operators (skipped if not given):
   --manifoldplus /path/to/manifold      (ManifoldPlus binary)
   --ftetwild     /path/to/FloatTetwild_bin
 """
-import argparse, csv, json, os, random, subprocess, sys, tempfile, time
+from __future__ import annotations
+
+import abc
+import argparse
+import csv
+import ctypes
+import enum
+import json
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
 try:
-    import resource          # not available on Windows
+    import resource          # Linux / macOS kernel resource limits
 except ImportError:
     resource = None
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 import numpy as np
 
@@ -31,6 +55,497 @@ MESH_EXT = (".stl", ".obj", ".ply", ".off", ".glb", ".gltf")
 N_SAMPLES = 5_000           # surface samples for quality metrics (exact point-to-surface)
 SHARP_ANGLE_DEG = 30.0      # dihedral angle that counts as a sharp edge
 SHARP_TOL = 1e-3            # an edge point is "kept" if the output passes within 0.1% of bbox diag
+
+# ---------------------------------------------------------------------------
+# Structured Status & Execution Result
+# ---------------------------------------------------------------------------
+
+class ExecutionStatus(str, enum.Enum):
+    SUCCESS = "SUCCESS"
+    TIMEOUT = "TIMEOUT"
+    OOM = "OOM"
+    ERROR = "ERROR"
+
+    @property
+    def csv_status(self) -> str:
+        """Maps structured status to CSV schema expected by analyze_pilot.py."""
+        return {
+            ExecutionStatus.SUCCESS: "ok",
+            ExecutionStatus.TIMEOUT: "timeout",
+            ExecutionStatus.OOM: "oom",
+            ExecutionStatus.ERROR: "error",
+        }[self]
+
+
+@dataclass
+class OperatorResult:
+    status: ExecutionStatus
+    execution_time: float
+    wall_time: float = 0.0
+    peak_mem_mb: float = 0.0
+    error_message: str = ""
+    returncode: Optional[int] = None
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+    def to_csv_dict(self) -> Dict[str, Any]:
+        """Convert result into the flat dictionary format used by the pilot CSV."""
+        row: Dict[str, Any] = {
+            "status": self.status.csv_status,
+            "error": self.error_message[:200] if self.error_message else "",
+            "time_s": self.execution_time,
+            "wall_s": self.wall_time or self.execution_time,
+            "peak_mem_mb": self.peak_mem_mb,
+        }
+        row.update(self.metrics)
+        return row
+
+
+# ---------------------------------------------------------------------------
+# Cross-Platform Resource Control (Linux RLIMIT_AS + Windows Job Objects & Watcher)
+# ---------------------------------------------------------------------------
+
+def _make_linux_preexec(max_mem_mb: float, new_process_group: bool = True) -> Optional[Callable[[], None]]:
+    """Builds a preexec_fn for Linux/POSIX subprocesses that enforces a strict RAM limit
+    via resource.setrlimit(RLIMIT_AS) and isolates the process group so descendant C++
+    binaries can be cleanly reaped on timeout/OOM."""
+    if resource is None or os.name != "posix":
+        return None
+
+    limit_bytes = int(max_mem_mb * 1024 * 1024)
+
+    def _set_limits() -> None:
+        if new_process_group:
+            os.setsid()
+        # Cap virtual address space (RLIMIT_AS). Exceeding this causes malloc/mmap
+        # to fail (MemoryError / std::bad_alloc) or the kernel to deliver SIGKILL (-9).
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        # Disable core dumps on SIGABRT / SIGSEGV from C++ binaries to avoid filling disk
+        if hasattr(resource, "RLIMIT_CORE"):
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    return _set_limits
+
+
+def _enable_windows_job_kill_on_close(max_mem_mb: Optional[float] = None) -> Optional[int]:
+    """Attaches the current Windows process (and all its future child processes, such as
+    manifold.exe or FloatTetwild_bin) to a Windows Job Object configured with:
+      - JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (terminates entire tree when worker exits)
+      - JOB_OBJECT_LIMIT_JOB_MEMORY / JOB_OBJECT_LIMIT_PROCESS_MEMORY (if max_mem_mb given)
+    Returns the job handle (kept open for process lifetime) or None."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+        JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+             ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if max_mem_mb is not None and max_mem_mb > 0:
+            limit_bytes = int(max_mem_mb * 1024 * 1024)
+            flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
+            info.ProcessMemoryLimit = limit_bytes
+            info.JobMemoryLimit = limit_bytes
+        info.BasicLimitInformation.LimitFlags = flags
+
+        ok = kernel32.SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+
+        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+            kernel32.CloseHandle(job)
+            return None
+
+        return int(job)
+    except Exception:
+        return None
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Terminates a process and all of its descendants across Windows and POSIX."""
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        # First kill descendants via psutil if available, then enforce with taskkill /F /T
+        if psutil is not None:
+            try:
+                parent = psutil.Process(pid)
+                for child in parent.children(recursive=True):
+                    try:
+                        child.kill()
+                    except psutil.Error:
+                        pass
+                parent.kill()
+            except psutil.Error:
+                pass
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+
+def _sample_process_tree_mem_bytes(pid: int) -> tuple[int, int]:
+    """Returns (current_rss_sum_bytes, high_water_peak_bytes) for `pid` and all its children.
+    On Windows, uses `peak_wset` from PROCESS_MEMORY_COUNTERS for true high-water mark accuracy."""
+    if psutil is None or pid <= 0:
+        return 0, 0
+    try:
+        root = psutil.Process(pid)
+        procs = [root] + root.children(recursive=True)
+    except psutil.Error:
+        return 0, 0
+
+    rss_total = 0
+    peak_total = 0
+    for p in procs:
+        try:
+            mi = p.memory_info()
+            rss = int(getattr(mi, "rss", 0))
+            peak = int(getattr(mi, "peak_wset", rss))
+            rss_total += rss
+            peak_total += max(rss, peak)
+        except psutil.Error:
+            continue
+    return rss_total, peak_total
+
+
+class _ProcessTreeWatchdog:
+    """Background watcher thread that monitors a running child PID (and its descendant
+    processes) for peak memory usage and enforces memory caps on platforms without RLIMIT_AS
+    (Windows) while subprocess.run() blocks in the foreground."""
+
+    def __init__(self, target_cmd_fragment: str, max_mem_mb: float, poll_interval: float = 0.05):
+        self.target_cmd_fragment = target_cmd_fragment
+        self.cap_bytes = int(max_mem_mb * 1024 * 1024)
+        self.poll_interval = poll_interval
+        self.peak_bytes: int = 0
+        self.killed_for_oom: bool = False
+        self.tracked_pid: Optional[int] = None
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        if psutil is not None:
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _discover_child_pid(self) -> Optional[int]:
+        if psutil is None:
+            return None
+        try:
+            me = psutil.Process(os.getpid())
+            for ch in me.children(recursive=False):
+                try:
+                    cmdline = " ".join(ch.cmdline())
+                    if self.target_cmd_fragment in cmdline:
+                        return ch.pid
+                except psutil.Error:
+                    continue
+        except psutil.Error:
+            pass
+        return None
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self.tracked_pid is None:
+                self.tracked_pid = self._discover_child_pid()
+            if self.tracked_pid is not None:
+                rss, peak = _sample_process_tree_mem_bytes(self.tracked_pid)
+                if peak > self.peak_bytes:
+                    self.peak_bytes = peak
+                if self.cap_bytes > 0 and max(rss, peak) > self.cap_bytes:
+                    self.killed_for_oom = True
+                    _kill_process_tree(self.tracked_pid)
+                    break
+            self._stop_event.wait(self.poll_interval)
+
+
+def _classify_failure(returncode: int, stderr_text: str, child_payload: Optional[Dict[str, Any]] = None) -> tuple[ExecutionStatus, str]:
+    """Determines whether a non-zero exit or child failure was an OOM or general ERROR."""
+    if child_payload and child_payload.get("status") == ExecutionStatus.OOM.value:
+        return ExecutionStatus.OOM, child_payload.get("error", "MemoryError in child worker")
+
+    oom_signals = {-9, -signal.SIGKILL.value if hasattr(signal, "SIGKILL") else -9}
+    # Windows STATUS_NO_MEMORY = 0xC0000017 (-1073741801 / 3221225495)
+    windows_oom_codes = {-1073741801, 0xC0000017}
+    oom_tokens = ("MemoryError", "bad_alloc", "Out of memory", "out of memory", "Cannot allocate memory", "Killed")
+
+    if returncode in oom_signals or returncode == 137 or returncode in windows_oom_codes:
+        return ExecutionStatus.OOM, f"Process killed by OS memory limit (returncode={returncode})"
+
+    combined_err = (stderr_text or "") + " " + (child_payload.get("error", "") if child_payload else "")
+    if any(tok in combined_err for tok in oom_tokens):
+        return ExecutionStatus.OOM, combined_err.strip()[-200:]
+
+    if child_payload and child_payload.get("error"):
+        return ExecutionStatus.ERROR, child_payload["error"][:200]
+
+    msg = stderr_text.strip()[-200:] if stderr_text else f"Subprocess exited with code {returncode}"
+    return ExecutionStatus.ERROR, msg
+
+
+class BaseMeshOperator(abc.ABC):
+    """Abstract base class that standardizes isolated subprocess execution, timeout,
+    Linux kernel memory limits (RLIMIT_AS), Windows Job Object + RSS watchdog enforcement,
+    process-tree cleanup, and temporary file cleanup for any mesh repair method."""
+
+    def __init__(self, name: str, timeout_s: float = 120.0, max_mem_mb: float = 8192.0):
+        self.name = name
+        self.timeout_s = float(timeout_s)
+        self.max_mem_mb = float(max_mem_mb)
+
+    @abc.abstractmethod
+    def run_in_worker(self, mesh, timeout_s: float, max_mem_mb: float, work_dir: str):
+        """Executes the actual repair logic inside the isolated worker process."""
+        raise NotImplementedError
+
+    @staticmethod
+    def run_external_command(
+        cmd: List[str],
+        timeout_s: float,
+        max_mem_mb: float,
+        cwd: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        """Executes a third-party C++ binary via subprocess.run with strict timeout,
+        Linux RLIMIT_AS memory cap, and cross-platform watchdog/tree cleanup."""
+        preexec = _make_linux_preexec(max_mem_mb, new_process_group=True)
+        fragment = os.path.basename(cmd[0]) if cmd else ""
+        watchdog = _ProcessTreeWatchdog(target_cmd_fragment=fragment, max_mem_mb=max_mem_mb)
+        watchdog.start()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                check=True,
+                timeout=timeout_s,
+                preexec_fn=preexec,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+            if watchdog.killed_for_oom:
+                raise MemoryError(f"External command exceeded memory cap ({max_mem_mb:.0f} MB)")
+            return proc
+        except subprocess.TimeoutExpired:
+            if watchdog.tracked_pid is not None:
+                _kill_process_tree(watchdog.tracked_pid)
+            raise
+        except subprocess.CalledProcessError as e:
+            if watchdog.killed_for_oom:
+                raise MemoryError(f"External command exceeded memory cap ({max_mem_mb:.0f} MB)") from e
+            raise
+        finally:
+            watchdog.stop()
+
+    def execute(self, mesh_path: str, cli_args: argparse.Namespace) -> OperatorResult:
+        """Runs this operator on `mesh_path` in a strictly isolated subprocess via subprocess.run.
+        Guarantees process-tree termination and cleanup of temporary directories/files even on
+        OOM, SIGKILL (-9), or TIMEOUT across both Linux and Windows."""
+        t0 = time.perf_counter()
+        # Dedicated temporary directory for this (mesh, chain) run; wiped in `finally`
+        work_dir = tempfile.mkdtemp(prefix=f"meshopt_{self.name.replace('+', '_')}_")
+        out_json = os.path.join(work_dir, "result.json")
+
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--_child",
+            mesh_path,
+            self.name,
+            out_json,
+            work_dir,
+            json.dumps(vars(cli_args)),
+        ]
+
+        preexec = _make_linux_preexec(self.max_mem_mb, new_process_group=True)
+        # Watchdog tracks the child process tree via unique `out_json` path in cmdline
+        watchdog = _ProcessTreeWatchdog(target_cmd_fragment=out_json, max_mem_mb=self.max_mem_mb)
+        watchdog.start()
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                timeout=self.timeout_s,
+                preexec_fn=preexec,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+            wall = time.perf_counter() - t0
+            watchdog.stop()
+
+            watchdog_peak_mb = watchdog.peak_bytes / (1024.0 ** 2)
+
+            if watchdog.killed_for_oom:
+                return OperatorResult(
+                    status=ExecutionStatus.OOM,
+                    execution_time=wall,
+                    wall_time=wall,
+                    peak_mem_mb=watchdog_peak_mb,
+                    error_message=f"Process exceeded memory cap ({self.max_mem_mb:.0f} MB)",
+                    returncode=proc.returncode,
+                )
+
+            payload: Optional[Dict[str, Any]] = None
+            if os.path.exists(out_json):
+                try:
+                    with open(out_json, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                except Exception:
+                    payload = None
+
+            child_peak_mb = float(payload.get("peak_mem_mb", 0.0)) if payload else 0.0
+            peak_mem_mb = max(child_peak_mb, watchdog_peak_mb)
+
+            if proc.returncode == 0 and payload and payload.get("status") == ExecutionStatus.SUCCESS.value:
+                return OperatorResult(
+                    status=ExecutionStatus.SUCCESS,
+                    execution_time=float(payload.get("time_s", wall)),
+                    wall_time=wall,
+                    peak_mem_mb=peak_mem_mb,
+                    returncode=0,
+                    metrics=payload.get("metrics", {}),
+                )
+
+            status, err_msg = _classify_failure(proc.returncode, proc.stderr, payload)
+            return OperatorResult(
+                status=status,
+                execution_time=wall,
+                wall_time=wall,
+                peak_mem_mb=peak_mem_mb,
+                error_message=err_msg,
+                returncode=proc.returncode,
+            )
+
+        except subprocess.TimeoutExpired:
+            wall = time.perf_counter() - t0
+            watchdog.stop()
+            if watchdog.tracked_pid is not None:
+                _kill_process_tree(watchdog.tracked_pid)
+            return OperatorResult(
+                status=ExecutionStatus.TIMEOUT,
+                execution_time=wall,
+                wall_time=wall,
+                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2),
+                error_message=f"Timed out after {self.timeout_s:.1f}s",
+            )
+        except Exception as e:
+            wall = time.perf_counter() - t0
+            watchdog.stop()
+            if watchdog.tracked_pid is not None:
+                _kill_process_tree(watchdog.tracked_pid)
+            return OperatorResult(
+                status=ExecutionStatus.ERROR,
+                execution_time=wall,
+                wall_time=wall,
+                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2),
+                error_message=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+        finally:
+            watchdog.stop()
+            # Always clean up temporary files created by the worker or crashed C++ binaries
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+class CallableChainOperator(BaseMeshOperator):
+    """Concrete operator wrapping a Python/C++ repair chain function."""
+
+    def __init__(
+        self,
+        name: str,
+        fn: Callable[[Any, float, float, str], Any],
+        timeout_s: float = 120.0,
+        max_mem_mb: float = 8192.0,
+    ):
+        super().__init__(name=name, timeout_s=timeout_s, max_mem_mb=max_mem_mb)
+        self._fn = fn
+
+    def run_in_worker(self, mesh, timeout_s: float, max_mem_mb: float, work_dir: str):
+        return self._fn(mesh, timeout_s, max_mem_mb, work_dir)
+
 
 # --------------------------------------------------------------------------- io
 
@@ -239,44 +754,86 @@ def op_udf_mc(m, res=256, band=1.5):
     return out
 
 
-def op_external(binary, kind, m, timeout):
-    """ManifoldPlus or fTetWild via their CLI."""
+def op_external(binary, kind, m, timeout, max_mem_mb=8192.0, work_dir=None):
+    """ManifoldPlus or fTetWild via their CLI, isolated with subprocess.run,
+    strict timeout, Linux RLIMIT_AS / Windows Job & watchdog memory cap, and guaranteed temp file cleanup."""
     import trimesh
-    with tempfile.TemporaryDirectory() as d:
-        src, dst = os.path.join(d, "in.obj"), os.path.join(d, "out.obj")
+    tmp_dir = tempfile.mkdtemp(prefix=f"ext_{kind}_", dir=work_dir)
+    try:
+        src, dst = os.path.join(tmp_dir, "in.obj"), os.path.join(tmp_dir, "out.obj")
         m.export(src)
         if kind == "manifoldplus":
             cmd = [binary, "--input", src, "--output", dst, "--depth", "8"]
         else:  # ftetwild, extract surface
-            cmd = [binary, "-i", src, "-o", os.path.join(d, "out.msh"), "--level", "2",
+            cmd = [binary, "-i", src, "-o", os.path.join(tmp_dir, "out.msh"), "--level", "2",
                    "--no-binary", "--manifold-surface"]
-            dst = os.path.join(d, "out.msh__sf.obj")
-        subprocess.run(cmd, check=True, timeout=timeout,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            dst = os.path.join(tmp_dir, "out.msh__sf.obj")
+
+        BaseMeshOperator.run_external_command(
+            cmd=cmd,
+            timeout_s=timeout,
+            max_mem_mb=max_mem_mb,
+            cwd=tmp_dir,
+        )
+        if not os.path.exists(dst):
+            raise RuntimeError(f"{kind} finished without producing output file")
         # process=False: ManifoldPlus may place distinct vertices at the same position;
         # merging them would wrongly break the (topologically closed) output.
         return trimesh.load(dst, force="mesh", process=False)
+    except subprocess.CalledProcessError as e:
+        status, msg = _classify_failure(e.returncode, e.stderr or "")
+        if status == ExecutionStatus.OOM:
+            raise MemoryError(msg) from e
+        raise RuntimeError(f"{kind} failed (code {e.returncode}): {msg}") from e
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def build_chains(args):
-    chains = {
-        "local":            lambda m: op_local_repair(m),
-        "local+dec":        lambda m: op_decimate(op_local_repair(m)),
-        "udf128":           lambda m: op_udf_mc(m, 128),
-        "udf256":           lambda m: op_udf_mc(m, 256),
-        "udf256+dec":       lambda m: op_decimate(op_udf_mc(m, 256), preserve_boundary=False),
-        "dec+udf256+dec":   lambda m: op_decimate(op_udf_mc(op_decimate(m, 200_000), 256),
-                                                  preserve_boundary=False),
+def build_operators(args) -> Dict[str, BaseMeshOperator]:
+    """Constructs the suite of fault-tolerant BaseMeshOperator instances."""
+    timeout_s = float(args.timeout)
+    max_mem_mb = float(args.mem_gb) * 1024.0
+
+    specs: Dict[str, Callable[[Any, float, float, str], Any]] = {
+        "local":          lambda m, t, mem, wd: op_local_repair(m),
+        "local+dec":      lambda m, t, mem, wd: op_decimate(op_local_repair(m)),
+        "udf128":         lambda m, t, mem, wd: op_udf_mc(m, 128),
+        "udf256":         lambda m, t, mem, wd: op_udf_mc(m, 256),
+        "udf256+dec":     lambda m, t, mem, wd: op_decimate(op_udf_mc(m, 256), preserve_boundary=False),
+        "dec+udf256+dec": lambda m, t, mem, wd: op_decimate(
+            op_udf_mc(op_decimate(m, 200_000), 256), preserve_boundary=False
+        ),
     }
     if args.manifoldplus:
         # ManifoldPlus wraps open/thin surfaces in a zero-thickness double shell; decimation can
         # fuse the two layers at a few edges, so a light local repair closes them again.
-        chains["manifoldplus+dec+fix"] = lambda m: op_local_repair(op_decimate(
-            op_external(args.manifoldplus, "manifoldplus", m, args.timeout), preserve_boundary=False))
+        specs["manifoldplus+dec+fix"] = lambda m, t, mem, wd: op_local_repair(
+            op_decimate(
+                op_external(args.manifoldplus, "manifoldplus", m, t, mem, wd),
+                preserve_boundary=False,
+            )
+        )
     if args.ftetwild:
-        chains["ftetwild+dec+fix"] = lambda m: op_local_repair(op_decimate(
-            op_external(args.ftetwild, "ftetwild", m, args.timeout), preserve_boundary=False))
-    return chains
+        specs["ftetwild+dec+fix"] = lambda m, t, mem, wd: op_local_repair(
+            op_decimate(
+                op_external(args.ftetwild, "ftetwild", m, t, mem, wd),
+                preserve_boundary=False,
+            )
+        )
+
+    return {
+        name: CallableChainOperator(name=name, fn=fn, timeout_s=timeout_s, max_mem_mb=max_mem_mb)
+        for name, fn in specs.items()
+    }
+
+
+def build_chains(args):
+    """Backwards-compatible helper returning operator names -> callables."""
+    ops = build_operators(args)
+    return {
+        name: (lambda m, _op=op: _op.run_in_worker(m, _op.timeout_s, _op.max_mem_mb, tempfile.gettempdir()))
+        for name, op in ops.items()
+    }
 
 # ------------------------------------------------------------ quality metrics
 
@@ -314,98 +871,121 @@ def surface_distance(mesh, pts):
     from trimesh.proximity import closest_point
     return closest_point(mesh, pts)[1]
 
-# ------------------------------------------------------------ one isolated run
+# ------------------------------------------------------------ isolated worker & pipeline
 
-def _child(path, chain_name, args_dict, conn_path):
-    """Runs inside a fresh process: memory cap, run chain, measure quality, write JSON."""
+def _get_peak_rss_mb() -> float:
+    """Returns true high-water mark peak working set of current process in MiB.
+    Uses resource.getrusage on Linux/macOS and PROCESS_MEMORY_COUNTERS.peak_wset on Windows."""
+    if resource is not None:
+        try:
+            ru_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            ru_child = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            kb = max(ru_self, ru_child)
+            # macOS reports ru_maxrss in bytes; Linux reports in kilobytes
+            if sys.platform == "darwin":
+                return float(kb) / (1024.0 ** 2)
+            return float(kb) / 1024.0
+        except Exception:
+            pass
+    if psutil is not None:
+        try:
+            mi = psutil.Process(os.getpid()).memory_info()
+            # On Windows, peak_wset records the true high-water mark working set in bytes
+            peak_bytes = getattr(mi, "peak_wset", getattr(mi, "rss", 0))
+            return float(peak_bytes) / (1024.0 ** 2)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _child(path: str, chain_name: str, args_dict: Dict[str, Any], conn_path: str, work_dir: str) -> None:
+    """Runs inside a fresh process spawned by BaseMeshOperator.execute().
+    Enforces RLIMIT_AS (Linux) or Job Object memory/kill-on-close limits (Windows),
+    runs the operator, measures quality, and writes structured JSON."""
     args = argparse.Namespace(**args_dict)
-    if resource is not None:   # Linux/macOS: hard cap inside the process as well
-        lim = int(args.mem_gb * 1024 ** 3)
-        resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
-    res = {}
+    max_mem_mb = float(args.mem_gb) * 1024.0
+
+    # Linux/POSIX kernel address-space limit
+    if resource is not None:
+        lim = int(max_mem_mb * 1024 * 1024)
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+        except Exception:
+            pass
+
+    # Windows kernel Job Object: enforces JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (so any
+    # grandchild C++ binary like manifold.exe dies immediately if this worker is killed)
+    # and JOB_OBJECT_LIMIT_JOB_MEMORY / PROCESS_MEMORY.
+    _job_handle = _enable_windows_job_kill_on_close(max_mem_mb=max_mem_mb)
+
+    res: Dict[str, Any] = {}
+    t0 = time.perf_counter()
     try:
         m = normalize(load_mesh(path))
-        t0 = time.perf_counter()
-        out = build_chains(args)[chain_name](m)
+        op = build_operators(args)[chain_name]
+        t_op = time.perf_counter()
+        out = op.run_in_worker(m, op.timeout_s, op.max_mem_mb, work_dir)
+        res["time_s"] = time.perf_counter() - t_op
+        res["metrics"] = quality(m, out)
+        res["status"] = ExecutionStatus.SUCCESS.value
+    except MemoryError as e:
         res["time_s"] = time.perf_counter() - t0
-        res.update(quality(m, out))
-        res["status"] = "ok"
-    except MemoryError:
-        res["status"] = "oom"
+        res["status"] = ExecutionStatus.OOM.value
+        res["error"] = f"MemoryError: {str(e)[:200]}"
+    except subprocess.TimeoutExpired as e:
+        res["time_s"] = time.perf_counter() - t0
+        res["status"] = ExecutionStatus.TIMEOUT.value
+        res["error"] = f"TimeoutExpired: {str(e)[:200]}"
     except Exception as e:
-        res["status"] = "error"
+        res["time_s"] = time.perf_counter() - t0
+        res["status"] = ExecutionStatus.ERROR.value
         res["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-    with open(conn_path, "w") as fh:
+
+    res["peak_mem_mb"] = _get_peak_rss_mb()
+    with open(conn_path, "w", encoding="utf-8") as fh:
         json.dump(res, fh)
 
 
-def run_isolated(path, chain_name, args):
-    """Run one (mesh, chain) in a subprocess so a hang or OOM cannot kill the pilot.
-    The parent watches the child: kills it past the timeout or the memory cap and records
-    its peak memory. Works on Windows, Linux and macOS."""
-    import psutil
-    fd, out_json = tempfile.mkstemp(suffix=".json"); os.close(fd)
-    fd, err_path = tempfile.mkstemp(suffix=".err"); os.close(fd)
-    cmd = [sys.executable, os.path.abspath(__file__), "--_child", path, chain_name, out_json,
-           json.dumps(vars(args))]
-    cap = args.mem_gb * 1024 ** 3
-    peak, status = 0, None
-    t0 = time.perf_counter()
-    with open(err_path, "w") as err:
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
-        try:
-            proc = psutil.Process(p.pid)
-        except psutil.Error:
-            proc = None
-        while p.poll() is None:
-            try:
-                rss = proc.memory_info().rss if proc else 0
-            except psutil.Error:
-                rss = 0
-            peak = max(peak, rss)
-            if rss > cap:
-                status = "oom"
-            elif time.perf_counter() - t0 > args.timeout:
-                status = "timeout"
-            if status:
-                p.kill(); p.wait()
-                break
-            time.sleep(0.05)
-    wall = time.perf_counter() - t0
-    if status:
-        res = {"status": status}
-    else:
-        try:
-            with open(out_json) as fh:
-                res = json.load(fh)
-        except Exception:
-            # died before writing (segfault in C++ code, OS out-of-memory kill)
-            with open(err_path, errors="ignore") as fh:
-                res = {"status": "crash", "error": fh.read()[-200:]}
-    for f in (out_json, err_path):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
-    res["peak_mem_mb"] = peak / 1024 ** 2
-    res["wall_s"] = wall
-    if res["status"] != "ok":
-        res["time_s"] = wall   # a failed attempt still costs its wall time
-    return res
+def run_isolated(path: str, chain_name: str, args: argparse.Namespace) -> Dict[str, Any]:
+    """Backwards-compatible wrapper executing a single operator via BaseMeshOperator."""
+    op = build_operators(args)[chain_name]
+    result = op.execute(path, args)
+    return result.to_csv_dict()
 
 
-def process_mesh(path, args):
-    rows = []
+def process_mesh(path: str, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Fault-tolerant pipeline for a single mesh:
+    1. Extracts cheap features.
+    2. Iterates sequentially over all configured BaseMeshOperators.
+    3. Isolates each operator in a subprocess via subprocess.run; on TIMEOUT, OOM, or ERROR,
+       logs the structured failure, cleans up temporary files, and continues to the next tool."""
+    mesh_name = os.path.basename(path)
     try:
         feats = cheap_features(load_mesh(path))
     except Exception as e:
-        return [{"mesh": os.path.basename(path), "chain": "_load", "status": "unreadable",
-                 "error": str(e)[:200]}]
-    for chain in build_chains(args):
-        r = {"mesh": os.path.basename(path), "chain": chain}
-        r.update(feats)
-        r.update(run_isolated(path, chain, args))
-        rows.append(r)
+        return [{
+            "mesh": mesh_name,
+            "chain": "_load",
+            "status": "unreadable",
+            "error": str(e)[:200],
+        }]
+
+    rows: List[Dict[str, Any]] = []
+    operators = build_operators(args)
+
+    for chain_name, operator in operators.items():
+        op_result: OperatorResult = operator.execute(path, args)
+
+        row: Dict[str, Any] = {"mesh": mesh_name, "chain": chain_name}
+        row.update(feats)
+        row.update(op_result.to_csv_dict())
+        rows.append(row)
+
+        # On OOM, TIMEOUT, or ERROR, operator.execute() has already reaped the child
+        # process and wiped its temporary directory; proceed cleanly to the next tool.
+        if op_result.status in (ExecutionStatus.OOM, ExecutionStatus.TIMEOUT, ExecutionStatus.ERROR):
+            continue
+
     return rows
 
 # ---------------------------------------------------------------------- main
@@ -419,8 +999,8 @@ COLUMNS = ["mesh", "chain", "status", "error", "time_s", "wall_s", "peak_mem_mb"
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--_child":
-        _, _, path, chain, out_json, args_json = sys.argv
-        _child(path, chain, json.loads(args_json), out_json)
+        _, _, path, chain, out_json, work_dir, args_json = sys.argv
+        _child(path, chain, json.loads(args_json), out_json, work_dir)
         return
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
@@ -447,7 +1027,7 @@ def main():
             done = {row["mesh"] for row in csv.DictReader(fh)}
     todo = [f for f in files if os.path.basename(f) not in done]
     print(f"{len(files)} meshes selected, {len(done)} already done, {len(todo)} to run, "
-          f"chains: {list(build_chains(args))}")
+          f"chains: {list(build_operators(args))}")
 
     new_file = not os.path.exists(args.out)
     with open(args.out, "a", newline="") as fh, ProcessPoolExecutor(args.workers) as pool:
