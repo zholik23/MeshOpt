@@ -1,0 +1,11 @@
+trimesh
+pymeshlab
+scikit-image
+scipy
+pandas
+scikit-learn
+rtree
+tabulate
+psutil
+pymeshfix
+libigl

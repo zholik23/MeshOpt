@@ -2,3 +2,5 @@ objaverse_sample/
 
 *.gz
 *.exe
+.venv/
+third_party/

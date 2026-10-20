@@ -5,7 +5,7 @@ Tests the one question everything depends on: **does the best repair chain depen
 ## Setup
 
 ```bash
-pip install trimesh pymeshlab scikit-image scipy pandas scikit-learn rtree tabulate
+pip install -r requirements.txt
 # Linux without a desktop may also need:  sudo apt install libopengl0
 ```
 
@@ -26,6 +26,22 @@ python analyze_pilot.py pilot_results.csv --out pilot_report.md
 
 `--workers` × `--mem-gb` must fit in your RAM. Optional: `--manifoldplus <binary>` and `--ftetwild <binary>` add those operators as extra chains.
 
+Building them on Linux (needs `sudo apt install build-essential cmake libgmp-dev`), into the git-ignored `third_party/`:
+
+```bash
+mkdir -p third_party && cd third_party
+git clone --recursive https://github.com/hjwdzh/ManifoldPlus
+(cd ManifoldPlus && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && make -j8)
+git clone --recursive https://github.com/wildmeshing/fTetWild
+cd fTetWild && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5   # fails once under CMake 4 (CMP0169); then:
+for f in $(grep -Rl 'FetchContent_Populate(' --include=*.cmake _deps/libigl-src/cmake); do
+  sed -i '0,/FetchContent_GetProperties\|FetchContent_Populate(/s//if(POLICY CMP0169)\n    cmake_policy(SET CMP0169 OLD)\nendif()\n&/' $f; done
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && make -j8
+```
+
+Then add `--manifoldplus third_party/ManifoldPlus/build/manifold --ftetwild third_party/fTetWild/build/FloatTetwild_bin`. fTetWild runs single-threaded per (mesh, chain), so its times are comparable to the other chains; large models can need a `--timeout` above 120 s.
+
 ## What it does
 
 For each mesh: computes cheap features (face count, boundary and non-manifold edge ratio, components, sampled self-intersections, sharp-edge ratio), then runs every chain in its own process with a hard timeout and memory cap, and measures:
@@ -36,7 +52,9 @@ For each mesh: computes cheap features (face count, boundary and non-manifold ed
 - Hausdorff and Chamfer distance to the input (relative to bbox diagonal)
 - sharp-edge recall: share of the input's sharp edges still on the output
 
-Chains: `local` (PyMeshLab cleanup), `local+dec`, `udf128`, `udf256` (unsigned distance field + Marching Cubes, the TripoSG/MeshGen recipe), `udf256+dec`, `dec+udf256+dec`.
+Chains: `local` (PyMeshLab cleanup), `local+dec`, `udf128`, `udf256` (unsigned distance field + Marching Cubes, the TripoSG/MeshGen recipe), `udf256+dec`, `dec+udf256+dec`. Added on Linux: `meshfix`, `meshfix+dec` (MeshFix per part: holes, self-intersections), `wn256`, `wn256+dec` (generalized winding number + Marching Cubes: robust to overlapping parts), `cull+local`, `cull+local+dec` (drop parts hidden inside others, then repair), `local+remesh`, `udf256+remesh` (isotropic remeshing instead of QEM). Run a subset with `--chains local,meshfix,wn256+dec`.
+
+Memory caps use a cgroup per run (`systemd-run --user --scope`, no root needed); without systemd an RSS watchdog takes over (`MESHOPT_NO_CGROUP=1` forces it).
 
 ## What the report tells you
 

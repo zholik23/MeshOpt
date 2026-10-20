@@ -101,203 +101,117 @@ class OperatorResult:
 
 
 # ---------------------------------------------------------------------------
-# Cross-Platform Resource Control (Linux RLIMIT_AS + Windows Job Objects & Watcher)
+# Linux Resource Control (cgroup v2 via systemd-run, RSS watchdog fallback)
 # ---------------------------------------------------------------------------
+#
+# Each (mesh, chain) child runs in its own transient systemd scope, i.e. its own cgroup,
+# with MemoryMax set to --mem-gb. The kernel then counts the real RAM of the child AND every
+# process it starts (e.g. ManifoldPlus / fTetWild) and OOM-kills inside that cgroup only when
+# the cap is crossed. This is the Linux counterpart of a Windows Job Object memory limit and
+# needs no root: systemd delegates the memory controller to the user session.
+#
+# If systemd-run is missing or the user manager is unreachable (containers, plain ssh without
+# lingering), we fall back to an RSS watchdog in the parent that kills the child's process
+# group once it crosses the cap. RLIMIT_AS is not used: it caps VIRTUAL memory, which numpy,
+# OpenBLAS and pymeshlab reserve far beyond what they touch, so it fails healthy runs.
+# Set MESHOPT_NO_CGROUP=1 to force the fallback.
 
-def _make_linux_preexec(max_mem_mb: float, new_process_group: bool = True) -> Optional[Callable[[], None]]:
-    """Builds a preexec_fn for Linux/POSIX subprocesses that enforces a strict RAM limit
-    via resource.setrlimit(RLIMIT_AS) and isolates the process group so descendant C++
-    binaries can be cleanly reaped on timeout/OOM."""
-    if resource is None or os.name != "posix":
-        return None
+_cgroup_ok: Optional[bool] = None
 
+
+def _cgroup_available() -> bool:
+    """True if `systemd-run --user --scope` can start a process in a memory-capped cgroup.
+    Probed once per process."""
+    global _cgroup_ok
+    if _cgroup_ok is None:
+        _cgroup_ok = False
+        exe = shutil.which("systemd-run")
+        if exe and os.environ.get("MESHOPT_NO_CGROUP") != "1":
+            try:
+                r = subprocess.run(
+                    [exe, "--user", "--scope", "--quiet", "--collect", "-p", "MemoryMax=64M", "--", "true"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+                _cgroup_ok = r.returncode == 0
+            except Exception:
+                pass
+    return _cgroup_ok
+
+
+def _cgroup_wrap(cmd: List[str], max_mem_mb: float) -> List[str]:
+    """Prefixes `cmd` so it runs in its own cgroup capped at `max_mem_mb` of RAM, with swap
+    disabled so an over-budget run is killed instead of thrashing. systemd-run --scope execs
+    the command in place, so the PID we get back from Popen is the command itself."""
     limit_bytes = int(max_mem_mb * 1024 * 1024)
-
-    def _set_limits() -> None:
-        if new_process_group:
-            os.setsid()
-        # Cap virtual address space (RLIMIT_AS). Exceeding this causes malloc/mmap
-        # to fail (MemoryError / std::bad_alloc) or the kernel to deliver SIGKILL (-9).
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-        # Disable core dumps on SIGABRT / SIGSEGV from C++ binaries to avoid filling disk
-        if hasattr(resource, "RLIMIT_CORE"):
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-    return _set_limits
+    return [
+        "systemd-run", "--user", "--scope", "--quiet", "--collect",
+        "-p", f"MemoryMax={limit_bytes}",
+        "-p", "MemorySwapMax=0",
+        "--",
+    ] + cmd
 
 
-def _enable_windows_job_kill_on_close(max_mem_mb: Optional[float] = None) -> Optional[int]:
-    """Attaches the current Windows process (and all its future child processes, such as
-    manifold.exe or FloatTetwild_bin) to a Windows Job Object configured with:
-      - JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (terminates entire tree when worker exits)
-      - JOB_OBJECT_LIMIT_JOB_MEMORY / JOB_OBJECT_LIMIT_PROCESS_MEMORY (if max_mem_mb given)
-    Returns the job handle (kept open for process lifetime) or None."""
-    if os.name != "nt":
-        return None
+def _die_with_parent() -> None:
+    """prctl(PR_SET_PDEATHSIG, SIGKILL): the kernel kills this process if the pool worker that
+    started it dies (Ctrl-C, crash), so no orphaned children keep eating RAM."""
     try:
-        kernel32 = ctypes.windll.kernel32
-        from ctypes import wintypes
-
-        class IO_COUNTERS(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-                ("IoInfo", IO_COUNTERS),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        JobObjectExtendedLimitInformation = 9
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
-        JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-
-        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-             ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        ]
-        kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        kernel32.GetCurrentProcess.argtypes = []
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            return None
-
-        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if max_mem_mb is not None and max_mem_mb > 0:
-            limit_bytes = int(max_mem_mb * 1024 * 1024)
-            flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY
-            info.ProcessMemoryLimit = limit_bytes
-            info.JobMemoryLimit = limit_bytes
-        info.BasicLimitInformation.LimitFlags = flags
-
-        ok = kernel32.SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        if not ok:
-            kernel32.CloseHandle(job)
-            return None
-
-        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
-            kernel32.CloseHandle(job)
-            return None
-
-        return int(job)
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
     except Exception:
-        return None
+        pass
+    # The parent may have died before prctl took effect.
+    if os.getppid() == 1:
+        os._exit(1)
 
 
 def _kill_process_tree(pid: int) -> None:
-    """Terminates a process and all of its descendants across Windows and POSIX."""
+    """SIGKILLs the child's whole process group. Children are started with
+    start_new_session=True, so the group id equals the child's PID and also covers any
+    external binary it launched."""
     if pid <= 0:
         return
-    if os.name == "nt":
-        # First kill descendants via psutil if available, then enforce with taskkill /F /T
-        if psutil is not None:
-            try:
-                parent = psutil.Process(pid)
-                for child in parent.children(recursive=True):
-                    try:
-                        child.kill()
-                    except psutil.Error:
-                        pass
-                parent.kill()
-            except psutil.Error:
-                pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
+            os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
-    else:
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except Exception:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except Exception:
-                pass
 
 
-def _sample_process_tree_mem_bytes(pid: int) -> tuple[int, int]:
-    """Returns (current_rss_sum_bytes, high_water_peak_bytes) for `pid` and all its children.
-    On Windows, uses `peak_wset` from PROCESS_MEMORY_COUNTERS for true high-water mark accuracy."""
+def _sample_process_tree_rss_bytes(pid: int) -> int:
+    """Sum of resident memory of `pid` and all of its descendants."""
     if psutil is None or pid <= 0:
-        return 0, 0
+        return 0
     try:
         root = psutil.Process(pid)
         procs = [root] + root.children(recursive=True)
     except psutil.Error:
-        return 0, 0
-
-    rss_total = 0
-    peak_total = 0
+        return 0
+    total = 0
     for p in procs:
         try:
-            mi = p.memory_info()
-            rss = int(getattr(mi, "rss", 0))
-            peak = int(getattr(mi, "peak_wset", rss))
-            rss_total += rss
-            peak_total += max(rss, peak)
+            total += int(p.memory_info().rss)
         except psutil.Error:
             continue
-    return rss_total, peak_total
+    return total
 
 
 class _ProcessTreeWatchdog:
-    """Background watcher thread that monitors a running child PID (and its descendant
-    processes) for peak memory usage and enforces memory caps on platforms without RLIMIT_AS
-    (Windows) while subprocess.run() blocks in the foreground."""
+    """Background thread that samples the RSS of a running child (and its descendants) to
+    record peak memory. When `enforce` is set (no cgroup available) it also kills the tree
+    once the cap is crossed."""
 
-    def __init__(self, target_cmd_fragment: str, max_mem_mb: float, poll_interval: float = 0.05):
-        self.target_cmd_fragment = target_cmd_fragment
+    def __init__(self, pid: int, max_mem_mb: float, enforce: bool, poll_interval: float = 0.05):
+        self.pid = pid
         self.cap_bytes = int(max_mem_mb * 1024 * 1024)
+        self.enforce = enforce
         self.poll_interval = poll_interval
         self.peak_bytes: int = 0
         self.killed_for_oom: bool = False
-        self.tracked_pid: Optional[int] = None
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -310,48 +224,27 @@ class _ProcessTreeWatchdog:
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
-    def _discover_child_pid(self) -> Optional[int]:
-        if psutil is None:
-            return None
-        try:
-            me = psutil.Process(os.getpid())
-            for ch in me.children(recursive=False):
-                try:
-                    cmdline = " ".join(ch.cmdline())
-                    if self.target_cmd_fragment in cmdline:
-                        return ch.pid
-                except psutil.Error:
-                    continue
-        except psutil.Error:
-            pass
-        return None
-
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            if self.tracked_pid is None:
-                self.tracked_pid = self._discover_child_pid()
-            if self.tracked_pid is not None:
-                rss, peak = _sample_process_tree_mem_bytes(self.tracked_pid)
-                if peak > self.peak_bytes:
-                    self.peak_bytes = peak
-                if self.cap_bytes > 0 and max(rss, peak) > self.cap_bytes:
-                    self.killed_for_oom = True
-                    _kill_process_tree(self.tracked_pid)
-                    break
+            rss = _sample_process_tree_rss_bytes(self.pid)
+            if rss > self.peak_bytes:
+                self.peak_bytes = rss
+            if self.enforce and self.cap_bytes > 0 and rss > self.cap_bytes:
+                self.killed_for_oom = True
+                _kill_process_tree(self.pid)
+                break
             self._stop_event.wait(self.poll_interval)
 
 
 def _classify_failure(returncode: int, stderr_text: str, child_payload: Optional[Dict[str, Any]] = None) -> tuple[ExecutionStatus, str]:
-    """Determines whether a non-zero exit or child failure was an OOM or general ERROR."""
+    """Determines whether a non-zero exit or child failure was an OOM or general ERROR.
+    A SIGKILL we did not send ourselves comes from the cgroup OOM killer."""
     if child_payload and child_payload.get("status") == ExecutionStatus.OOM.value:
         return ExecutionStatus.OOM, child_payload.get("error", "MemoryError in child worker")
 
-    oom_signals = {-9, -signal.SIGKILL.value if hasattr(signal, "SIGKILL") else -9}
-    # Windows STATUS_NO_MEMORY = 0xC0000017 (-1073741801 / 3221225495)
-    windows_oom_codes = {-1073741801, 0xC0000017}
     oom_tokens = ("MemoryError", "bad_alloc", "Out of memory", "out of memory", "Cannot allocate memory", "Killed")
 
-    if returncode in oom_signals or returncode == 137 or returncode in windows_oom_codes:
+    if returncode in (-signal.SIGKILL, 128 + signal.SIGKILL):
         return ExecutionStatus.OOM, f"Process killed by OS memory limit (returncode={returncode})"
 
     combined_err = (stderr_text or "") + " " + (child_payload.get("error", "") if child_payload else "")
@@ -367,8 +260,8 @@ def _classify_failure(returncode: int, stderr_text: str, child_payload: Optional
 
 class BaseMeshOperator(abc.ABC):
     """Abstract base class that standardizes isolated subprocess execution, timeout,
-    Linux kernel memory limits (RLIMIT_AS), Windows Job Object + RSS watchdog enforcement,
-    process-tree cleanup, and temporary file cleanup for any mesh repair method."""
+    cgroup memory limits (RSS watchdog as fallback), process-tree cleanup,
+    and temporary file cleanup for any mesh repair method."""
 
     def __init__(self, name: str, timeout_s: float = 120.0, max_mem_mb: float = 8192.0):
         self.name = name
@@ -387,42 +280,24 @@ class BaseMeshOperator(abc.ABC):
         max_mem_mb: float,
         cwd: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
-        """Executes a third-party C++ binary via subprocess.run with strict timeout,
-        Linux RLIMIT_AS memory cap, and cross-platform watchdog/tree cleanup."""
-        preexec = _make_linux_preexec(max_mem_mb, new_process_group=True)
-        fragment = os.path.basename(cmd[0]) if cmd else ""
-        watchdog = _ProcessTreeWatchdog(target_cmd_fragment=fragment, max_mem_mb=max_mem_mb)
-        watchdog.start()
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cwd,
-                check=True,
-                timeout=timeout_s,
-                preexec_fn=preexec,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
-            )
-            if watchdog.killed_for_oom:
-                raise MemoryError(f"External command exceeded memory cap ({max_mem_mb:.0f} MB)")
-            return proc
-        except subprocess.TimeoutExpired:
-            if watchdog.tracked_pid is not None:
-                _kill_process_tree(watchdog.tracked_pid)
-            raise
-        except subprocess.CalledProcessError as e:
-            if watchdog.killed_for_oom:
-                raise MemoryError(f"External command exceeded memory cap ({max_mem_mb:.0f} MB)") from e
-            raise
-        finally:
-            watchdog.stop()
+        """Executes a third-party C++ binary from inside the child worker. It inherits the
+        child's cgroup and process group, so the memory cap and the parent's
+        kill-on-timeout already cover it; here we only add its own timeout."""
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=True,
+            timeout=timeout_s,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
 
     def execute(self, mesh_path: str, cli_args: argparse.Namespace) -> OperatorResult:
-        """Runs this operator on `mesh_path` in a strictly isolated subprocess via subprocess.run.
-        Guarantees process-tree termination and cleanup of temporary directories/files even on
-        OOM, SIGKILL (-9), or TIMEOUT across both Linux and Windows."""
+        """Runs this operator on `mesh_path` in an isolated child process (own cgroup, own
+        process group). Guarantees process-tree termination and cleanup of temporary
+        directories even on OOM, SIGKILL or TIMEOUT."""
         t0 = time.perf_counter()
         # Dedicated temporary directory for this (mesh, chain) run; wiped in `finally`
         work_dir = tempfile.mkdtemp(prefix=f"meshopt_{self.name.replace('+', '_')}_")
@@ -438,22 +313,24 @@ class BaseMeshOperator(abc.ABC):
             work_dir,
             json.dumps(vars(cli_args)),
         ]
+        use_cgroup = _cgroup_available()
+        if use_cgroup:
+            cmd = _cgroup_wrap(cmd, self.max_mem_mb)
 
-        preexec = _make_linux_preexec(self.max_mem_mb, new_process_group=True)
-        # Watchdog tracks the child process tree via unique `out_json` path in cmdline
-        watchdog = _ProcessTreeWatchdog(target_cmd_fragment=out_json, max_mem_mb=self.max_mem_mb)
-        watchdog.start()
-
+        proc: Optional[subprocess.Popen] = None
+        watchdog: Optional[_ProcessTreeWatchdog] = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                timeout=self.timeout_s,
-                preexec_fn=preexec,
+                start_new_session=True,      # own process group -> killpg reaches all descendants
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
             )
+            watchdog = _ProcessTreeWatchdog(proc.pid, self.max_mem_mb, enforce=not use_cgroup)
+            watchdog.start()
+            _, stderr = proc.communicate(timeout=self.timeout_s)
             wall = time.perf_counter() - t0
             watchdog.stop()
 
@@ -490,7 +367,7 @@ class BaseMeshOperator(abc.ABC):
                     metrics=payload.get("metrics", {}),
                 )
 
-            status, err_msg = _classify_failure(proc.returncode, proc.stderr, payload)
+            status, err_msg = _classify_failure(proc.returncode, stderr, payload)
             return OperatorResult(
                 status=status,
                 execution_time=wall,
@@ -502,30 +379,32 @@ class BaseMeshOperator(abc.ABC):
 
         except subprocess.TimeoutExpired:
             wall = time.perf_counter() - t0
-            watchdog.stop()
-            if watchdog.tracked_pid is not None:
-                _kill_process_tree(watchdog.tracked_pid)
             return OperatorResult(
                 status=ExecutionStatus.TIMEOUT,
                 execution_time=wall,
                 wall_time=wall,
-                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2),
+                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2) if watchdog else 0.0,
                 error_message=f"Timed out after {self.timeout_s:.1f}s",
             )
         except Exception as e:
             wall = time.perf_counter() - t0
-            watchdog.stop()
-            if watchdog.tracked_pid is not None:
-                _kill_process_tree(watchdog.tracked_pid)
             return OperatorResult(
                 status=ExecutionStatus.ERROR,
                 execution_time=wall,
                 wall_time=wall,
-                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2),
+                peak_mem_mb=watchdog.peak_bytes / (1024.0 ** 2) if watchdog else 0.0,
                 error_message=f"{type(e).__name__}: {str(e)[:200]}",
             )
         finally:
-            watchdog.stop()
+            if watchdog is not None:
+                watchdog.stop()
+            if proc is not None and proc.returncode is None:
+                # Timeout or error: the child is still running, so kill its whole group and reap it.
+                _kill_process_tree(proc.pid)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
             # Always clean up temporary files created by the worker or crashed C++ binaries
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -712,6 +591,15 @@ def op_local_repair(m):
     return from_ms(ms)
 
 
+def op_fix_if_broken(m):
+    """Local repair only when the mesh is not already closed and manifold. Volume meshers
+    (ManifoldPlus, fTetWild) emit valid surfaces that may touch themselves at a vertex;
+    running the repair on those merges the touching vertices and makes them non-manifold."""
+    if m.is_watertight and m.is_winding_consistent:
+        return m
+    return op_local_repair(m)
+
+
 def op_decimate(m, target=10_000, preserve_boundary=True):
     if len(m.faces) <= target:
         return m
@@ -754,9 +642,126 @@ def op_udf_mc(m, res=256, band=1.5):
     return out
 
 
+def split_parts(m):
+    """Connected components as compact (vertices, faces) pairs. trimesh's split() gives each
+    part a copy of the full vertex buffer, which needs GBs on models with hundreds of parts."""
+    from trimesh.graph import connected_component_labels
+    labels = connected_component_labels(m.face_adjacency, node_count=len(m.faces))
+    order = np.argsort(labels, kind="stable")
+    bounds = np.flatnonzero(np.diff(labels[order])) + 1
+    parts = []
+    for fids in np.split(order, bounds):
+        used, f = np.unique(m.faces[fids], return_inverse=True)
+        parts.append((np.asarray(m.vertices[used], np.float64), f.reshape(-1, 3)))
+    return parts
+
+
+def op_meshfix(m):
+    """MeshFix (Attene): fills holes and removes self-intersections, a second local repair.
+    MeshFix always returns a single component, so each part is repaired on its own and the
+    results are joined; parts MeshFix deletes entirely (e.g. flat sheets) are dropped."""
+    import pymeshfix
+    import trimesh
+    out_v, out_f, n = [], [], 0
+    for v, f in split_parts(m):
+        mf = pymeshfix.MeshFix(v, f.astype(np.int32))
+        mf.repair(joincomp=False, remove_smallest_components=False)
+        if len(mf.faces):
+            out_v.append(mf.points)
+            out_f.append(mf.faces + n)
+            n += len(mf.points)
+    if not out_f:
+        raise RuntimeError("meshfix removed every face")
+    return trimesh.Trimesh(np.concatenate(out_v), np.concatenate(out_f), process=False)
+
+
+def op_remesh(m, target=8_000, featuredeg=SHARP_ANGLE_DEG, iterations=5, rounds=3):
+    """Isotropic explicit remeshing (PyMeshLab) to about `target` faces: an alternative to QEM
+    decimation that gives well-shaped triangles. The edge length comes from the surface area
+    (equilateral triangles) and is rescaled from the face count actually reached if a round
+    still lands above 10k. Edges sharper than `featuredeg` are kept as features; pass ~60 for
+    Marching Cubes output, whose voxel staircase would otherwise lock most edges."""
+    import pymeshlab
+    if len(m.faces) <= target:
+        return m
+    edge = float(np.sqrt(4.0 * m.area / (np.sqrt(3.0) * target)))
+    for _ in range(rounds):
+        ms = to_ms(m)
+        ms.meshing_isotropic_explicit_remeshing(
+            iterations=iterations, targetlen=pymeshlab.PureValue(edge), featuredeg=featuredeg)
+        out = from_ms(ms)
+        if len(out.faces) <= 10_000:
+            break
+        edge *= float(np.sqrt(len(out.faces) / target))
+    return out
+
+
+def op_winding_mc(m, res=256):
+    """Generalized winding number (libigl, Jacobson et al. 2013) on a res^3 grid + Marching
+    Cubes at 0.5. Robust inside/outside for overlapping, self-intersecting and slightly open
+    parts; thin open sheets with no volume vanish. Same grid layout as op_udf_mc."""
+    import igl
+    from skimage import measure
+    import trimesh
+    pad = 4
+    lo, hi = m.bounds
+    size = (hi - lo).max()
+    h = size / (res - 2 * pad)
+    # samples at cell centres: the bbox faces (and any plane aligned with them) fall between
+    # samples instead of on them, where w == 0.5 exactly makes Marching Cubes degenerate
+    axis = (np.arange(res) - pad + 0.5) * h
+    gx, gy, gz = np.meshgrid(axis + lo[0], axis + lo[1], axis + lo[2], indexing="ij")
+    q = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+    del gx, gy, gz
+    w = igl.fast_winding_number(np.asarray(m.vertices, np.float64), np.asarray(m.faces, np.int64), q)
+    del q
+    # |w|: parts with inverted orientation count as inside too
+    vol = np.abs(w).reshape(res, res, res).astype(np.float32)
+    vol[np.abs(vol - 0.5) < 1e-4] = 0.5 - 1e-4
+    if vol.max() <= 0.5:
+        raise RuntimeError("winding number never exceeds 0.5: no enclosed volume")
+    verts, faces, _, _ = measure.marching_cubes(vol, level=0.5)
+    verts = (verts - pad + 0.5) * h + lo
+    out = trimesh.Trimesh(verts, faces, process=True)
+    out.fix_normals()
+    return out
+
+
+def op_remove_hidden(m, samples_per_part=64, eps=1e-3, hidden_share=0.9):
+    """Drops components fully enclosed by the rest of the model (engine internals, inner
+    copies), which only add faces and overlaps. A part is hidden if points pushed just off
+    BOTH sides of its surface are inside the other parts (|winding number| > 0.5). The winding
+    number is additive over faces, so the other parts' share is the whole mesh's value minus
+    the part's own: one evaluation on the whole mesh plus one small one per part."""
+    import igl
+    import trimesh
+    parts = [trimesh.Trimesh(v, f, process=False) for v, f in split_parts(m)]
+    parts = [p for p in parts if p.area > 0]
+    if len(parts) < 2:
+        return m
+    k = samples_per_part
+    pts, own = [], []
+    for i, p in enumerate(parts):
+        s, fi = trimesh.sample.sample_surface(p, k, seed=i)
+        n = p.face_normals[fi]
+        q = np.concatenate([s + eps * n, s - eps * n])
+        pts.append(q)
+        own.append(igl.fast_winding_number(p.vertices, np.asarray(p.faces, np.int64), q))
+    w = igl.fast_winding_number(np.asarray(m.vertices, np.float64),
+                                np.asarray(m.faces, np.int64), np.concatenate(pts))
+    others = w - np.concatenate(own)
+    # (part, side, sample); |w| so parts with inverted orientation still enclose
+    inside = (np.abs(others).reshape(len(parts), 2, k) > 0.5).all(axis=1)
+    hidden = inside.mean(axis=1) >= hidden_share
+    keep = [p for p, h in zip(parts, hidden) if not h]
+    if not keep:
+        return m
+    return trimesh.util.concatenate(keep)
+
+
 def op_external(binary, kind, m, timeout, max_mem_mb=8192.0, work_dir=None):
     """ManifoldPlus or fTetWild via their CLI, isolated with subprocess.run,
-    strict timeout, Linux RLIMIT_AS / Windows Job & watchdog memory cap, and guaranteed temp file cleanup."""
+    strict timeout, the child's cgroup memory cap, and guaranteed temp file cleanup."""
     import trimesh
     tmp_dir = tempfile.mkdtemp(prefix=f"ext_{kind}_", dir=work_dir)
     try:
@@ -765,8 +770,10 @@ def op_external(binary, kind, m, timeout, max_mem_mb=8192.0, work_dir=None):
         if kind == "manifoldplus":
             cmd = [binary, "--input", src, "--output", dst, "--depth", "8"]
         else:  # ftetwild, extract surface
+            # one thread per run: the pool already keeps every core busy, and fTetWild's
+            # default of all cores would oversubscribe the machine and skew its timings
             cmd = [binary, "-i", src, "-o", os.path.join(tmp_dir, "out.msh"), "--level", "2",
-                   "--no-binary", "--manifold-surface"]
+                   "--no-binary", "--manifold-surface", "--max-threads", "1"]
             dst = os.path.join(tmp_dir, "out.msh__sf.obj")
 
         BaseMeshOperator.run_external_command(
@@ -803,23 +810,38 @@ def build_operators(args) -> Dict[str, BaseMeshOperator]:
         "dec+udf256+dec": lambda m, t, mem, wd: op_decimate(
             op_udf_mc(op_decimate(m, 200_000), 256), preserve_boundary=False
         ),
+        "meshfix":        lambda m, t, mem, wd: op_meshfix(m),
+        "meshfix+dec":    lambda m, t, mem, wd: op_decimate(op_meshfix(m)),
+        "wn256":          lambda m, t, mem, wd: op_winding_mc(m, 256),
+        "wn256+dec":      lambda m, t, mem, wd: op_decimate(op_winding_mc(m, 256), preserve_boundary=False),
+        "cull+local":     lambda m, t, mem, wd: op_local_repair(op_remove_hidden(m)),
+        "cull+local+dec": lambda m, t, mem, wd: op_decimate(op_local_repair(op_remove_hidden(m))),
+        "local+remesh":   lambda m, t, mem, wd: op_remesh(op_local_repair(m)),
+        "udf256+remesh":  lambda m, t, mem, wd: op_remesh(op_udf_mc(m, 256), featuredeg=60.0),
     }
     if args.manifoldplus:
         # ManifoldPlus wraps open/thin surfaces in a zero-thickness double shell; decimation can
         # fuse the two layers at a few edges, so a light local repair closes them again.
-        specs["manifoldplus+dec+fix"] = lambda m, t, mem, wd: op_local_repair(
+        specs["manifoldplus+dec+fix"] = lambda m, t, mem, wd: op_fix_if_broken(
             op_decimate(
                 op_external(args.manifoldplus, "manifoldplus", m, t, mem, wd),
                 preserve_boundary=False,
             )
         )
     if args.ftetwild:
-        specs["ftetwild+dec+fix"] = lambda m, t, mem, wd: op_local_repair(
+        specs["ftetwild+dec+fix"] = lambda m, t, mem, wd: op_fix_if_broken(
             op_decimate(
                 op_external(args.ftetwild, "ftetwild", m, t, mem, wd),
                 preserve_boundary=False,
             )
         )
+
+    if getattr(args, "chains", None):
+        wanted = [c.strip() for c in args.chains.split(",") if c.strip()]
+        unknown = [c for c in wanted if c not in specs]
+        if unknown:
+            raise SystemExit(f"unknown chain(s) {unknown}; available: {list(specs)}")
+        specs = {c: specs[c] for c in wanted}
 
     return {
         name: CallableChainOperator(name=name, fn=fn, timeout_s=timeout_s, max_mem_mb=max_mem_mb)
@@ -874,25 +896,13 @@ def surface_distance(mesh, pts):
 # ------------------------------------------------------------ isolated worker & pipeline
 
 def _get_peak_rss_mb() -> float:
-    """Returns true high-water mark peak working set of current process in MiB.
-    Uses resource.getrusage on Linux/macOS and PROCESS_MEMORY_COUNTERS.peak_wset on Windows."""
+    """Returns the high-water mark RSS of this process (or its largest child) in MiB."""
     if resource is not None:
         try:
             ru_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             ru_child = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-            kb = max(ru_self, ru_child)
-            # macOS reports ru_maxrss in bytes; Linux reports in kilobytes
-            if sys.platform == "darwin":
-                return float(kb) / (1024.0 ** 2)
-            return float(kb) / 1024.0
-        except Exception:
-            pass
-    if psutil is not None:
-        try:
-            mi = psutil.Process(os.getpid()).memory_info()
-            # On Windows, peak_wset records the true high-water mark working set in bytes
-            peak_bytes = getattr(mi, "peak_wset", getattr(mi, "rss", 0))
-            return float(peak_bytes) / (1024.0 ** 2)
+            # Linux reports ru_maxrss in kilobytes
+            return float(max(ru_self, ru_child)) / 1024.0
         except Exception:
             pass
     return 0.0
@@ -900,23 +910,11 @@ def _get_peak_rss_mb() -> float:
 
 def _child(path: str, chain_name: str, args_dict: Dict[str, Any], conn_path: str, work_dir: str) -> None:
     """Runs inside a fresh process spawned by BaseMeshOperator.execute().
-    Enforces RLIMIT_AS (Linux) or Job Object memory/kill-on-close limits (Windows),
+    The memory cap is enforced from outside (its cgroup, or the parent's RSS watchdog);
     runs the operator, measures quality, and writes structured JSON."""
     args = argparse.Namespace(**args_dict)
-    max_mem_mb = float(args.mem_gb) * 1024.0
 
-    # Linux/POSIX kernel address-space limit
-    if resource is not None:
-        lim = int(max_mem_mb * 1024 * 1024)
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
-        except Exception:
-            pass
-
-    # Windows kernel Job Object: enforces JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (so any
-    # grandchild C++ binary like manifold.exe dies immediately if this worker is killed)
-    # and JOB_OBJECT_LIMIT_JOB_MEMORY / PROCESS_MEMORY.
-    _job_handle = _enable_windows_job_kill_on_close(max_mem_mb=max_mem_mb)
+    _die_with_parent()
 
     res: Dict[str, Any] = {}
     t0 = time.perf_counter()
@@ -1013,7 +1011,17 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--manifoldplus", default=None)
     ap.add_argument("--ftetwild", default=None)
+    ap.add_argument("--chains", default=None,
+                    help="comma-separated subset of chains to run (default: all)")
     args = ap.parse_args()
+    # external binaries run with cwd = their temp dir, so relative paths must be resolved here
+    for opt in ("manifoldplus", "ftetwild"):
+        exe = getattr(args, opt)
+        if exe:
+            exe = shutil.which(exe) or exe
+            if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+                ap.error(f"--{opt}: {exe} is not an executable file")
+            setattr(args, opt, os.path.abspath(exe))
 
     files = sorted(os.path.join(r, f) for r, _, fs in os.walk(args.input)
                    for f in fs if f.lower().endswith(MESH_EXT))
