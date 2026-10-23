@@ -140,13 +140,31 @@ def _cgroup_available() -> bool:
     return _cgroup_ok
 
 
+# Every run is single-threaded: the pool already keeps all cores busy, and BLAS / OpenMP
+# (PyMeshLab) / libigl would each start one thread per core in every run, oversubscribing
+# the CPU and making timings depend on how many workers run at once.
+_SINGLE_THREAD_ENV = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                          MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1", IGL_NUM_THREADS="1")
+
+_SLICE = "meshopt.slice"           # parent cgroup of every run, capped by --total-mem-gb
+
+
+def _cap_all_runs(total_mem_gb: float) -> None:
+    """Caps the summed RAM of all concurrent runs, so many workers with a generous per-run
+    cap can never exhaust the machine; if the total is hit the kernel kills the largest run."""
+    if total_mem_gb > 0 and _cgroup_available():
+        subprocess.run(["systemctl", "--user", "set-property", "--runtime", _SLICE,
+                        f"MemoryMax={int(total_mem_gb * 1024 ** 3)}", "MemorySwapMax=0"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def _cgroup_wrap(cmd: List[str], max_mem_mb: float) -> List[str]:
     """Prefixes `cmd` so it runs in its own cgroup capped at `max_mem_mb` of RAM, with swap
     disabled so an over-budget run is killed instead of thrashing. systemd-run --scope execs
     the command in place, so the PID we get back from Popen is the command itself."""
     limit_bytes = int(max_mem_mb * 1024 * 1024)
     return [
-        "systemd-run", "--user", "--scope", "--quiet", "--collect",
+        "systemd-run", "--user", "--scope", "--quiet", "--collect", f"--slice={_SLICE}",
         "-p", f"MemoryMax={limit_bytes}",
         "-p", "MemorySwapMax=0",
         "--",
@@ -322,6 +340,7 @@ class BaseMeshOperator(abc.ABC):
         try:
             proc = subprocess.Popen(
                 cmd,
+                env=_SINGLE_THREAD_ENV,
                 start_new_session=True,      # own process group -> killpg reaches all descendants
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -664,11 +683,16 @@ def op_meshfix(m):
     import trimesh
     out_v, out_f, n = [], [], 0
     for v, f in split_parts(m):
-        mf = pymeshfix.MeshFix(v, f.astype(np.int32))
-        mf.repair(joincomp=False, remove_smallest_components=False)
+        # MeshFix sometimes deletes a valid closed part as-is but keeps it with flipped
+        # orientation; retry flipped and flip the result back
+        for flip in (False, True):
+            mf = pymeshfix.MeshFix(v, (f[:, ::-1] if flip else f).astype(np.int32))
+            mf.repair(joincomp=False, remove_smallest_components=False)
+            if len(mf.faces):
+                break
         if len(mf.faces):
             out_v.append(mf.points)
-            out_f.append(mf.faces + n)
+            out_f.append((mf.faces[:, ::-1] if flip else mf.faces) + n)
             n += len(mf.points)
     if not out_f:
         raise RuntimeError("meshfix removed every face")
@@ -1011,6 +1035,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--manifoldplus", default=None)
     ap.add_argument("--ftetwild", default=None)
+    ap.add_argument("--total-mem-gb", type=float, default=0.8 * (psutil.virtual_memory().total / 1024 ** 3 if psutil else 0),
+                    help="cap on the summed RAM of all concurrent runs (default: 80%% of RAM)")
     ap.add_argument("--chains", default=None,
                     help="comma-separated subset of chains to run (default: all)")
     args = ap.parse_args()
@@ -1028,6 +1054,8 @@ def main():
     random.Random(args.seed).shuffle(files)
     if args.limit:
         files = files[:args.limit]
+
+    _cap_all_runs(args.total_mem_gb)
 
     done = set()
     if os.path.exists(args.out):
