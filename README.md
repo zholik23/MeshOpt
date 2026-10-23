@@ -56,6 +56,12 @@ Chains: `local` (PyMeshLab cleanup), `local+dec`, `udf128`, `udf256` (unsigned d
 
 Memory caps use a cgroup per run (`systemd-run --user --scope`, no root needed); without systemd an RSS watchdog takes over (`MESHOPT_NO_CGROUP=1` forces it).
 
+### Draco (optional, needs `pip install DracoPy`)
+
+- Input: `.drc` files and `.glb`/`.gltf` files using `KHR_draco_mesh_compression` (common in Objaverse) are decoded automatically.
+- Output compression: `--draco-bits 10,12,14` Draco-compresses every successful chain output at each quantization level and adds one row per level, named `<chain>+draco<bits>`, with the usual validity/distance columns plus `draco_bits`, `draco_bytes` and `raw_bytes` (float32 vertices + uint32 indices). The repair runs only once, and `time_s` = repair + Draco round trip. `--draco-level` (0-10, default 7) sets the compression effort.
+- Write to a new `--out` file (the CSV has 3 new columns) and drop `+draco` rows before the repair-routing analysis: they are compression variants, not repair chains.
+
 ## What the report tells you
 
 Three requirement profiles: **sdf** (watertight only), **token** (watertight, manifold, 500–10k faces), **cad** (token + sharp edges kept). For each:

@@ -51,7 +51,7 @@ except ImportError:
 
 import numpy as np
 
-MESH_EXT = (".stl", ".obj", ".ply", ".off", ".glb", ".gltf")
+MESH_EXT = (".stl", ".obj", ".ply", ".off", ".glb", ".gltf", ".drc")
 N_SAMPLES = 5_000           # surface samples for quality metrics (exact point-to-surface)
 SHARP_ANGLE_DEG = 30.0      # dihedral angle that counts as a sharp edge
 SHARP_TOL = 1e-3            # an edge point is "kept" if the output passes within 0.1% of bbox diag
@@ -449,13 +449,211 @@ class CallableChainOperator(BaseMeshOperator):
 
 def load_mesh(path):
     import trimesh
-    m = trimesh.load(path, force="mesh", process=False)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".drc":
+        m = _load_drc(path)
+    elif ext in (".glb", ".gltf") and _gltf_uses_draco(path):
+        # trimesh cannot read KHR_draco_mesh_compression; decode those primitives with DracoPy
+        m = _load_gltf_draco(path)
+    else:
+        m = trimesh.load(path, force="mesh", process=False)
     if not isinstance(m, trimesh.Trimesh) or len(m.faces) == 0:
         raise ValueError("empty or non-triangle mesh")
     # STL stores a triangle soup: weld coincident vertices so edges and adjacency exist.
     # This is the same trivial step for every chain, not a repair.
     m.merge_vertices()
     return m
+
+
+# ------------------------------------------------------------------ draco (optional)
+# DracoPy is imported lazily: nothing here is needed unless the input has Draco data or
+# --draco-bits is set, so the script still runs without it installed.
+
+def _draco():
+    try:
+        import DracoPy
+    except ImportError as e:
+        raise RuntimeError("DracoPy is not installed (pip install DracoPy)") from e
+    return DracoPy
+
+
+def _draco_to_trimesh(blob):
+    import trimesh
+    d = _draco().decode(blob)
+    v = np.asarray(d.points, dtype=np.float64).reshape(-1, 3)
+    f = np.asarray(d.faces, dtype=np.int64).reshape(-1, 3)
+    if len(f) == 0:
+        raise ValueError("Draco data has no faces (point cloud)")
+    return trimesh.Trimesh(v, f, process=False)
+
+
+def _load_drc(path):
+    with open(path, "rb") as fh:
+        return _draco_to_trimesh(fh.read())
+
+
+def _gltf_read(path):
+    """Returns (json, embedded GLB binary chunk or None)."""
+    import struct
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:4] != b"glTF":
+        return json.loads(data.decode("utf-8")), None
+    js, binc, off = None, None, 12
+    while off + 8 <= len(data):
+        ln, typ = struct.unpack_from("<I4s", data, off)
+        off += 8
+        chunk = data[off:off + ln]
+        off += ln
+        if typ == b"JSON":
+            js = json.loads(chunk.decode("utf-8"))
+        elif typ == b"BIN\x00":
+            binc = chunk
+    if js is None:
+        raise ValueError("GLB without JSON chunk")
+    return js, binc
+
+
+def _gltf_uses_draco(path):
+    try:
+        js, _ = _gltf_read(path)
+    except Exception:
+        return False
+    return "KHR_draco_mesh_compression" in js.get("extensionsUsed", [])
+
+
+def _gltf_buffer(js, i, binc, base_dir, cache):
+    if i in cache:
+        return cache[i]
+    uri = js["buffers"][i].get("uri")
+    if uri is None:
+        data = binc
+    elif uri.startswith("data:"):
+        import base64
+        data = base64.b64decode(uri.split(",", 1)[1])
+    else:
+        from urllib.parse import unquote
+        with open(os.path.join(base_dir, unquote(uri)), "rb") as fh:
+            data = fh.read()
+    cache[i] = data
+    return data
+
+
+def _gltf_view(js, vi, binc, base_dir, cache):
+    bv = js["bufferViews"][vi]
+    buf = _gltf_buffer(js, bv["buffer"], binc, base_dir, cache)
+    o = bv.get("byteOffset", 0)
+    return buf[o:o + bv["byteLength"]], bv.get("byteStride")
+
+
+_GLTF_DTYPE = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16,
+               5125: np.uint32, 5126: np.float32}
+_GLTF_NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+
+
+def _gltf_accessor(js, ai, binc, base_dir, cache):
+    """Plain (non-Draco) accessor -> numpy array (count, ncomp). Sparse accessors unsupported."""
+    acc = js["accessors"][ai]
+    dt = np.dtype(_GLTF_DTYPE[acc["componentType"]])
+    nc = _GLTF_NCOMP[acc["type"]]
+    n = acc["count"]
+    view, stride = _gltf_view(js, acc["bufferView"], binc, base_dir, cache)
+    o = acc.get("byteOffset", 0)
+    item = dt.itemsize * nc
+    if stride and stride != item:
+        raw = np.frombuffer(view, np.uint8, count=(n - 1) * stride + item, offset=o)
+        rows = np.lib.stride_tricks.as_strided(raw, (n, item), (stride, 1))
+        return np.ascontiguousarray(rows).view(dt).reshape(n, nc)
+    return np.frombuffer(view, dt, count=n * nc, offset=o).reshape(n, nc)
+
+
+def _node_matrix(node):
+    if "matrix" in node:
+        return np.asarray(node["matrix"], dtype=np.float64).reshape(4, 4).T  # column-major
+    t = np.asarray(node.get("translation", [0, 0, 0]), dtype=np.float64)
+    x, y, z, w = node.get("rotation", [0, 0, 0, 1])
+    sc = np.asarray(node.get("scale", [1, 1, 1]), dtype=np.float64)
+    r = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    M = np.eye(4)
+    M[:3, :3] = r * sc
+    M[:3, 3] = t
+    return M
+
+
+def _load_gltf_draco(path):
+    """Reads a .glb/.gltf whose primitives may use KHR_draco_mesh_compression: decodes each
+    triangle primitive (Draco or plain), applies node transforms, concatenates into one mesh."""
+    import trimesh
+    js, binc = _gltf_read(path)
+    base_dir, cache = os.path.dirname(os.path.abspath(path)), {}
+
+    def prim_mesh(p):
+        if p.get("mode", 4) != 4:                    # triangles only
+            return None
+        ext = p.get("extensions", {}).get("KHR_draco_mesh_compression")
+        if ext is not None:
+            view, _ = _gltf_view(js, ext["bufferView"], binc, base_dir, cache)
+            return _draco_to_trimesh(bytes(view))
+        if "POSITION" not in p.get("attributes", {}):
+            return None
+        v = _gltf_accessor(js, p["attributes"]["POSITION"], binc, base_dir, cache).astype(np.float64)
+        if "indices" in p:
+            f = _gltf_accessor(js, p["indices"], binc, base_dir, cache).reshape(-1, 3).astype(np.int64)
+        else:
+            f = np.arange(len(v) - len(v) % 3, dtype=np.int64).reshape(-1, 3)
+        return trimesh.Trimesh(v, f, process=False)
+
+    mesh_cache = {}
+
+    def mesh_parts(mi):
+        if mi not in mesh_cache:
+            mesh_cache[mi] = [pm for pm in (prim_mesh(p) for p in js["meshes"][mi]["primitives"])
+                              if pm is not None and len(pm.faces)]
+        return mesh_cache[mi]
+
+    parts = []
+    nodes = js.get("nodes", [])
+    scenes = js.get("scenes", [])
+    if scenes:
+        roots = scenes[js.get("scene", 0)].get("nodes", [])
+        stack = [(n, np.eye(4)) for n in roots]
+        while stack:
+            ni, parent = stack.pop()
+            node = nodes[ni]
+            M = parent @ _node_matrix(node)
+            if "mesh" in node:
+                for pm in mesh_parts(node["mesh"]):
+                    pm = pm.copy()
+                    pm.apply_transform(M)
+                    parts.append(pm)
+            stack.extend((c, M) for c in node.get("children", []))
+    else:
+        for mi in range(len(js.get("meshes", []))):
+            parts.extend(pm.copy() for pm in mesh_parts(mi))
+    if not parts:
+        raise ValueError("glTF has no triangle primitives")
+    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+
+
+def op_draco(m, bits, level=7):
+    """Draco round trip: encode positions+faces with `bits`-bit quantization, decode, and
+    return the decoded (lossy) mesh. Sizes go to out.metadata for the CSV."""
+    v = np.ascontiguousarray(m.vertices, dtype=np.float32)
+    f = np.ascontiguousarray(m.faces, dtype=np.uint32)
+    blob = _draco().encode(v, f, quantization_bits=int(bits), compression_level=int(level))
+    out = _draco_to_trimesh(blob)
+    out.merge_vertices()   # same welding step load_mesh applies to every input
+    out.metadata["draco_bits"] = int(bits)
+    out.metadata["draco_bytes"] = len(blob)
+    out.metadata["raw_bytes"] = int(v.nbytes + f.nbytes)   # float32 xyz + uint32 indices
+    return out
+
+
+def _parse_draco_bits(args):
+    raw = getattr(args, "draco_bits", None)
+    return [int(b) for b in str(raw).split(",") if b.strip()] if raw else []
 
 
 def normalize(m):
@@ -949,6 +1147,24 @@ def _child(path: str, chain_name: str, args_dict: Dict[str, Any], conn_path: str
         out = op.run_in_worker(m, op.timeout_s, op.max_mem_mb, work_dir)
         res["time_s"] = time.perf_counter() - t_op
         res["metrics"] = quality(m, out)
+        # Optional Draco step on the repaired output. Every bit depth is one extra CSV row
+        # "<chain>+draco<bits>" (see process_mesh); the repair itself runs only once.
+        draco_rows = []
+        for bits in _parse_draco_bits(args):
+            t_d = time.perf_counter()
+            try:
+                dm = op_draco(out, bits, getattr(args, "draco_level", 7))
+                q = quality(m, dm)
+                q.update(draco_bits=bits, draco_bytes=dm.metadata["draco_bytes"],
+                         raw_bytes=dm.metadata["raw_bytes"])
+                draco_rows.append({"status": "ok", "metrics": q,
+                                   "draco_time_s": time.perf_counter() - t_d})
+            except Exception as e:
+                draco_rows.append({"status": "error", "metrics": {"draco_bits": bits},
+                                   "error": f"{type(e).__name__}: {str(e)[:200]}",
+                                   "draco_time_s": time.perf_counter() - t_d})
+        if draco_rows:
+            res["metrics"]["_draco"] = draco_rows
         res["status"] = ExecutionStatus.SUCCESS.value
     except MemoryError as e:
         res["time_s"] = time.perf_counter() - t0
@@ -998,10 +1214,23 @@ def process_mesh(path: str, args: argparse.Namespace) -> List[Dict[str, Any]]:
     for chain_name, operator in operators.items():
         op_result: OperatorResult = operator.execute(path, args)
 
+        draco_rows = op_result.metrics.pop("_draco", [])
         row: Dict[str, Any] = {"mesh": mesh_name, "chain": chain_name}
         row.update(feats)
         row.update(op_result.to_csv_dict())
         rows.append(row)
+        # Draco variants of a successful run: time = repair time + encode/decode/measure
+        for d in draco_rows:
+            drow = dict(row)
+            for k in ("out_faces", "watertight", "manifold", "hausdorff_rel",
+                      "chamfer_rel", "sharp_recall"):
+                drow.pop(k, None)
+            drow.update(d["metrics"])
+            drow["chain"] = f"{chain_name}+draco{d['metrics']['draco_bits']}"
+            drow["status"] = d["status"]
+            drow["error"] = d.get("error", "")
+            drow["time_s"] = row["time_s"] + d["draco_time_s"]
+            rows.append(drow)
 
         # On OOM, TIMEOUT, or ERROR, operator.execute() has already reaped the child
         # process and wiped its temporary directory; proceed cleanly to the next tool.
@@ -1016,7 +1245,7 @@ COLUMNS = ["mesh", "chain", "status", "error", "time_s", "wall_s", "peak_mem_mb"
            "out_faces", "watertight", "manifold", "hausdorff_rel", "chamfer_rel", "sharp_recall",
            "n_faces", "n_verts", "aspect_ratio", "boundary_edge_ratio", "nonmanifold_edge_ratio",
            "degenerate_face_ratio", "n_components", "self_intersect_est", "sharp_edge_ratio",
-           "feature_time_s"]
+           "feature_time_s", "draco_bits", "draco_bytes", "raw_bytes"]
 
 
 def main():
@@ -1039,7 +1268,22 @@ def main():
                     help="cap on the summed RAM of all concurrent runs (default: 80%% of RAM)")
     ap.add_argument("--chains", default=None,
                     help="comma-separated subset of chains to run (default: all)")
+    ap.add_argument("--draco-bits", default=None,
+                    help="e.g. 10,12,14: after each successful chain, Draco-compress its output at\n"
+                         "these quantization bits and add a row '<chain>+draco<bits>' (needs DracoPy)")
+    ap.add_argument("--draco-level", type=int, default=7, help="Draco compression level 0-10")
     args = ap.parse_args()
+    if args.draco_bits:
+        try:
+            bits = _parse_draco_bits(args)
+        except ValueError:
+            ap.error("--draco-bits must be comma-separated integers, e.g. 10,12,14")
+        if any(not 1 <= b <= 30 for b in bits):
+            ap.error("--draco-bits values must be between 1 and 30")
+        try:
+            _draco()   # fail early if DracoPy is missing
+        except RuntimeError as e:
+            ap.error(str(e))
     # external binaries run with cwd = their temp dir, so relative paths must be resolved here
     for opt in ("manifoldplus", "ftetwild"):
         exe = getattr(args, opt)
