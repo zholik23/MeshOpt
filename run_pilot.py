@@ -643,8 +643,9 @@ def op_draco(m, bits, level=7):
     v = np.ascontiguousarray(m.vertices, dtype=np.float32)
     f = np.ascontiguousarray(m.faces, dtype=np.uint32)
     blob = _draco().encode(v, f, quantization_bits=int(bits), compression_level=int(level))
+    # no merge_vertices(): Draco keeps the connectivity, and welding would fuse parts that
+    # only touch (e.g. MeshFix / fTetWild output), breaking watertightness Draco did not break
     out = _draco_to_trimesh(blob)
-    out.merge_vertices()   # same welding step load_mesh applies to every input
     out.metadata["draco_bits"] = int(bits)
     out.metadata["draco_bytes"] = len(blob)
     out.metadata["raw_bytes"] = int(v.nbytes + f.nbytes)   # float32 xyz + uint32 indices
@@ -1246,6 +1247,7 @@ COLUMNS = ["mesh", "chain", "status", "error", "time_s", "wall_s", "peak_mem_mb"
            "n_faces", "n_verts", "aspect_ratio", "boundary_edge_ratio", "nonmanifold_edge_ratio",
            "degenerate_face_ratio", "n_components", "self_intersect_est", "sharp_edge_ratio",
            "feature_time_s", "draco_bits", "draco_bytes", "raw_bytes"]
+DRACO_COLUMNS = ["draco_bits", "draco_bytes", "raw_bytes"]
 
 
 def main():
@@ -1310,8 +1312,19 @@ def main():
           f"chains: {list(build_operators(args))}")
 
     new_file = not os.path.exists(args.out)
+    fieldnames = COLUMNS
+    if not new_file:
+        # Append in the file's own column order. A file from before the Draco columns can be
+        # resumed as long as no Draco rows are written; anything else would misalign rows.
+        with open(args.out, newline="") as fh:
+            header = next(csv.reader(fh), [])
+        needed = COLUMNS if args.draco_bits else [c for c in COLUMNS if c not in DRACO_COLUMNS]
+        if header and (set(header) - set(COLUMNS) or set(needed) - set(header)):
+            ap.error(f"{args.out} has a different column layout (older version of this script, "
+                     f"or no Draco columns while --draco-bits is set). Use a new --out file.")
+        fieldnames = header or COLUMNS
     with open(args.out, "a", newline="") as fh, ProcessPoolExecutor(args.workers) as pool:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
+        w = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         if new_file:
             w.writeheader()
         futs = {pool.submit(process_mesh, f, args): f for f in todo}

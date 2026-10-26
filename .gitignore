@@ -4,3 +4,4 @@ objaverse_sample/
 *.exe
 .venv/
 third_party/
+__pycache__/

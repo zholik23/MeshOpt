@@ -180,6 +180,45 @@ def analyze_profile(df, name, rule, out):
             "top5% time share": tail_share(t_best, .05) * 100}
 
 
+def draco_section(dr, rep, out):
+    """Draco rows ('<chain>+draco<bits>') are compression variants of a repair output, not
+    repair chains. Reports size and quality cost per bit depth, paired with the base run."""
+    dr = dr.copy()
+    dr["base"] = dr.chain.str.rsplit("+draco", n=1).str[0]
+    for c in ["draco_bits", "draco_bytes", "raw_bytes"]:
+        dr[c] = pd.to_numeric(dr[c], errors="coerce")
+    pair = dr.merge(rep, left_on=["mesh", "base"], right_on=["mesh", "chain"],
+                    suffixes=("", "_base"))
+    pair = pair[pair.ok_base]
+    pair["ratio"] = pair.raw_bytes / pair.draco_bytes
+    pair["d_haus"] = pair.hausdorff_rel - pair.hausdorff_rel_base
+    rows = []
+    for bits, g in pair.groupby("draco_bits"):
+        row = {"bits": int(bits), "runs": len(g), "ok %": g.ok.mean() * 100,
+               "median size ratio (raw/draco)": g.ratio.median(),
+               "median extra hausdorff": g.d_haus.median(),
+               "p95 extra hausdorff": g.d_haus.quantile(0.95)}
+        wt = g[g.watertight_base]
+        row["watertight kept %"] = (wt.ok & wt.watertight).mean() * 100 if len(wt) else float("nan")
+        for name, rule in PROFILES.items():
+            base_ok = g[_rule_on(g, rule, "_base")]
+            kept = (base_ok.ok & _rule_on(base_ok, rule, "")).mean() * 100 if len(base_ok) else float("nan")
+            row[f"{name.split(' ')[0]} success kept %"] = kept
+        rows.append(row)
+    out.append("\n## Draco compression\n\nEach row compares a successful repair output with "
+               "its Draco round trip at that quantization. Sizes: float32 vertices + uint32 "
+               "indices vs the Draco bitstream. \"success kept\": of the outputs meeting a "
+               "profile before compression, the share still meeting it after.\n\n"
+               + pd.DataFrame(rows).set_index("bits").round(3).to_markdown() + "\n")
+
+
+def _rule_on(df, rule, suffix):
+    """Applies a profile rule to the columns carrying `suffix` (e.g. the base run's)."""
+    cols = ["watertight", "manifold", "out_faces", "hausdorff_rel", "sharp_recall"]
+    view = pd.DataFrame({c: df[c + suffix] for c in cols}, index=df.index)
+    return rule(view).fillna(False).astype(bool)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
@@ -192,12 +231,17 @@ def main():
     df = load(a.csv)
     if df.empty:
         sys.exit(f"'{a.csv}' has no results yet. Wait until run_pilot.py has processed some meshes.")
+    # Draco rows are compression variants, not repair chains: keep them out of Q1-Q4
+    is_draco = df.chain.str.contains("+draco", regex=False)
+    draco, df = df[is_draco], df[~is_draco].copy()
     out = ["# MeshOpt pilot report\n",
            f"{df.mesh.nunique()} meshes, {df.chain.nunique()} chains, {len(df)} runs. "
            f"Status counts: {df.status.value_counts().to_dict()}.\n",
            f"Cheap-feature extraction: median {df.groupby('mesh').feature_time_s.first().median():.3f} s "
            f"per mesh (must stay far below repair time).\n"]
     summary = [analyze_profile(df, n, r, out) for n, r in PROFILES.items()]
+    if len(draco):
+        draco_section(draco, df, out)
     out.insert(3, "\n## Summary\n\n" + pd.DataFrame(summary).set_index("profile").round(1).to_markdown()
                + "\n\nGo/no-go rule of thumb: gap >= 10 points on some profile AND router saves >= 20% "
                  "compute -> build MeshOpt. Thresholds are a starting point to agree with your advisor.\n")
