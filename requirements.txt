@@ -10,3 +10,4 @@ psutil
 pymeshfix
 libigl
 DracoPy
+catboost

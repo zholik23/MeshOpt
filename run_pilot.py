@@ -642,14 +642,67 @@ def op_draco(m, bits, level=7):
     return the decoded (lossy) mesh. Sizes go to out.metadata for the CSV."""
     v = np.ascontiguousarray(m.vertices, dtype=np.float32)
     f = np.ascontiguousarray(m.faces, dtype=np.uint32)
+    t0 = time.perf_counter()
     blob = _draco().encode(v, f, quantization_bits=int(bits), compression_level=int(level))
-    # no merge_vertices(): Draco keeps the connectivity, and welding would fuse parts that
-    # only touch (e.g. MeshFix / fTetWild output), breaking watertightness Draco did not break
+    t1 = time.perf_counter()
     out = _draco_to_trimesh(blob)
+    t2 = time.perf_counter()
+    out.metadata["draco_encode_s"] = t1 - t0
+    out.metadata["draco_decode_s"] = t2 - t1
+    # No merge_vertices here: Draco keeps the connectivity it was given, and welding coincident
+    # vertices would wrongly break watertight double-layer outputs (ManifoldPlus, fTetWild).
     out.metadata["draco_bits"] = int(bits)
     out.metadata["draco_bytes"] = len(blob)
     out.metadata["raw_bytes"] = int(v.nbytes + f.nbytes)   # float32 xyz + uint32 indices
     return out
+
+
+class _PeakMem:
+    """Extra RAM (MiB) a block of code needs above what the process already holds.
+    Linux: resets the kernel's peak-RSS counter (VmHWM) and reads it back, so even a
+    millisecond-long native allocation inside DracoPy is counted. Elsewhere: samples RSS."""
+
+    def __enter__(self):
+        self.mb, self._hwm = 0.0, False
+        try:
+            with open("/proc/self/clear_refs", "w") as fh:
+                fh.write("5")
+            self._hwm = True
+        except OSError:
+            pass
+        self.base = self._status("VmRSS") if self._hwm else self._rss()
+        self._peak, self._stop = self.base, threading.Event()
+        if not self._hwm and psutil is not None:
+            self._t = threading.Thread(target=self._sample, daemon=True)
+            self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._hwm:
+            self._peak = max(self._peak, self._status("VmHWM"))
+        else:
+            self._stop.set()
+            if psutil is not None:
+                self._t.join()
+            self._peak = max(self._peak, self._rss())
+        self.mb = max(0.0, self._peak - self.base)
+        return False
+
+    @staticmethod
+    def _status(key):
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1]) / 1024.0      # kB -> MiB
+        return 0.0
+
+    @staticmethod
+    def _rss():
+        return psutil.Process().memory_info().rss / 1024.0 ** 2 if psutil is not None else 0.0
+
+    def _sample(self):
+        while not self._stop.wait(0.002):
+            self._peak = max(self._peak, self._rss())
 
 
 def _parse_draco_bits(args):
@@ -1154,10 +1207,14 @@ def _child(path: str, chain_name: str, args_dict: Dict[str, Any], conn_path: str
         for bits in _parse_draco_bits(args):
             t_d = time.perf_counter()
             try:
-                dm = op_draco(out, bits, getattr(args, "draco_level", 7))
+                with _PeakMem() as pm:
+                    dm = op_draco(out, bits, getattr(args, "draco_level", 7))
                 q = quality(m, dm)
-                q.update(draco_bits=bits, draco_bytes=dm.metadata["draco_bytes"],
-                         raw_bytes=dm.metadata["raw_bytes"])
+                md = dm.metadata
+                q.update(draco_bits=bits, draco_bytes=md["draco_bytes"], raw_bytes=md["raw_bytes"],
+                         draco_ratio=md["raw_bytes"] / max(md["draco_bytes"], 1),
+                         draco_encode_s=md["draco_encode_s"], draco_decode_s=md["draco_decode_s"],
+                         draco_mem_mb=pm.mb)
                 draco_rows.append({"status": "ok", "metrics": q,
                                    "draco_time_s": time.perf_counter() - t_d})
             except Exception as e:
@@ -1246,8 +1303,10 @@ COLUMNS = ["mesh", "chain", "status", "error", "time_s", "wall_s", "peak_mem_mb"
            "out_faces", "watertight", "manifold", "hausdorff_rel", "chamfer_rel", "sharp_recall",
            "n_faces", "n_verts", "aspect_ratio", "boundary_edge_ratio", "nonmanifold_edge_ratio",
            "degenerate_face_ratio", "n_components", "self_intersect_est", "sharp_edge_ratio",
-           "feature_time_s", "draco_bits", "draco_bytes", "raw_bytes"]
-DRACO_COLUMNS = ["draco_bits", "draco_bytes", "raw_bytes"]
+           "feature_time_s", "draco_bits", "draco_bytes", "raw_bytes", "draco_ratio",
+           "draco_encode_s", "draco_decode_s", "draco_mem_mb"]
+DRACO_COLUMNS = ["draco_bits", "draco_bytes", "raw_bytes", "draco_ratio",
+                 "draco_encode_s", "draco_decode_s", "draco_mem_mb"]
 
 
 def main():

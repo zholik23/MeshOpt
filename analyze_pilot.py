@@ -32,6 +32,11 @@ PROFILES = {
 def load(path):
     df = pd.read_csv(path)
     df = df[df.chain != "_load"].copy()
+    # When the cgroup OOM killer kills an external binary (fTetWild, ManifoldPlus), systemd
+    # stops the whole run scope with SIGTERM, so the Python child exits with -15 and older
+    # run_pilot.py versions logged it as "error". Nothing else sends SIGTERM to a run.
+    sigterm = df.status.eq("error") & df.error.astype(str).str.contains("exited with code -15")
+    df.loc[sigterm, "status"] = "oom"
     for c in ["watertight", "manifold"]:
         df[c] = df[c].astype(str).str.lower().eq("true")
     for c in ["out_faces", "hausdorff_rel", "sharp_recall", "time_s"]:
@@ -185,7 +190,10 @@ def draco_section(dr, rep, out):
     repair chains. Reports size and quality cost per bit depth, paired with the base run."""
     dr = dr.copy()
     dr["base"] = dr.chain.str.rsplit("+draco", n=1).str[0]
-    for c in ["draco_bits", "draco_bytes", "raw_bytes"]:
+    for c in ["draco_bits", "draco_bytes", "raw_bytes", "draco_encode_s", "draco_decode_s",
+              "draco_mem_mb"]:
+        if c not in dr:
+            dr[c] = np.nan     # files from before these columns existed
         dr[c] = pd.to_numeric(dr[c], errors="coerce")
     pair = dr.merge(rep, left_on=["mesh", "base"], right_on=["mesh", "chain"],
                     suffixes=("", "_base"))
@@ -197,7 +205,10 @@ def draco_section(dr, rep, out):
         row = {"bits": int(bits), "runs": len(g), "ok %": g.ok.mean() * 100,
                "median size ratio (raw/draco)": g.ratio.median(),
                "median extra hausdorff": g.d_haus.median(),
-               "p95 extra hausdorff": g.d_haus.quantile(0.95)}
+               "p95 extra hausdorff": g.d_haus.quantile(0.95),
+               "median encode ms": g.draco_encode_s.median() * 1000,
+               "median decode ms": g.draco_decode_s.median() * 1000,
+               "median extra RAM MB": g.draco_mem_mb.median()}
         wt = g[g.watertight_base]
         row["watertight kept %"] = (wt.ok & wt.watertight).mean() * 100 if len(wt) else float("nan")
         for name, rule in PROFILES.items():
